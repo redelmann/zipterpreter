@@ -56,11 +56,19 @@ case class InAbs(env: Env) extends Layer
   * The type of focus is left abstract.
   * In practice, this will generarally be an expression or
   */
-case class Focused[A](focus: A, context: Context, env: Env)
+case class Focused[+A](focus: A, context: Context, env: Env)
 
 
-/** Zipper-based interpreter for lambda calulus expressions. */
-object ZippyInterpreter {
+/** A zipper-based interpreter for lambda calulus expressions.
+  *
+  * @param verbose Indicates if a trace should be printed to
+  *                standard output.
+  */
+class ZippyInterpreter(val verbose: Boolean) {
+
+  /** If `verbose`, prints a line to standard output. */
+  private def display(text: => String): Unit =
+    if (verbose) println(text)
 
   /** Performs a step of evaluation.
     *
@@ -69,14 +77,15 @@ object ZippyInterpreter {
     *
     * In a first phase, the focus is moved down the expression
     * towards the smallest left-most unevalualted expression.
-    * Then, the expression is turned into a value.
     *
-    * In a second phase, the focus is moved up the context,
+    * In a second phase, that basic expression is turned into a value.
+    *
+    * In a third and final phase phase, the focus is moved up the context,
     * applying layers until either the context is empty of
     * the next unevaluated expression is found.
     */
   def step(expr: Focused[Expr]): Either[Value, Focused[Expr]] =
-    up(down(expr))
+    up(replace(down(expr)))
 
   /** Applies an unbounded number of evaluation `step`s
     * on a focused expression until hopefully a value is returned.
@@ -84,50 +93,103 @@ object ZippyInterpreter {
     * This method is not garanteed to terminate.
     */
   @tailrec
-  def eval(expr: Focused[Expr]): Value = step(expr) match {
+  final def eval(expr: Focused[Expr]): Value = step(expr) match {
     case Left(value) => value
     case Right(newExpr) => eval(newExpr)
   }
 
-  /** Moves the focus down towards the smallest left-most unevaluated expression
-    * and evaluates it, leaving it in the same context.
-    */
+  /** Moves the focus down towards the smallest left-most unevaluated expression. */
   @tailrec
-  def down(state: Focused[Expr]): Focused[Value] = state.focus match {
-    case Var(name) =>
-      Focused(state.env(name), state.context, state.env)
+  final def down(state: Focused[Expr]): Focused[Basic] = stepDown(state) match {
+    case Left(newState) => {
+      display("\n======= DOWN =======\n")
+      display(Display(newState))
+      down(newState)
+    }
+    case Right(newState) =>
+      newState
+  }
+
+  /** Moves the focus downwards one step.
+    *
+    * Results with the focus either on an expression which must be downwards visited,
+    * or on a basic expression which can directly be turned in a value.
+    */
+  def stepDown(state: Focused[Expr]): Either[Focused[Expr], Focused[Basic]] = state.focus match {
+    case basic: Basic =>
+      Right(Focused(basic, state.context, state.env))
     case App(fun, arg) =>
-      down(Focused(fun, InAppLeft(arg) :: state.context, state.env))
-    case abs@Abs(_, _) =>
-      Focused(Closure(state.env, abs), state.context, state.env)
-    case prim@Prim(_) =>
-      Focused(prim, state.context, state.env)
+      Left(Focused(fun, InAppLeft(arg) :: state.context, state.env))
+  }
+
+  /** Replaces the basic expression in focus with the corresponding value. */
+  def replace(state: Focused[Basic]): Focused[Value] = {
+    val newState = Focused(state.focus.eval(state.env), state.context, state.env)
+    display("\n======= REP. =======\n")
+    display(Display(newState))
+    newState
   }
 
   /** Moves the focus up towards the first left-most unevaluated expression. */
   @tailrec
-  def up(state: Focused[Value]): Either[Value, Focused[Expr]] = state.context match {
-    case Nil =>
+  final def up(state: Focused[Value]): Either[Value, Focused[Expr]] = stepUp(state) match {
+    case None =>
       Left(state.focus)
-    case InAppLeft(arg) :: rest =>
-      Right(Focused(arg, InAppRight(state.focus) :: rest, state.env))
-    case InAppRight(Closure(env, Abs(name, body))) :: rest =>
-      Right(Focused(body, InAbs(state.env) :: rest, env + (name -> state.focus)))
-    case InAppRight(Prim(fun)) :: rest => {
-      val Prim(arg) = state.focus
-      val casted = fun.asInstanceOf[Any => Any]
-      up(Focused(Prim(casted(arg)), rest, state.env))
+    case Some(Left(newState)) => {
+      display("\n======== UP ========\n")
+      display(Display(newState))
+      up(newState)
     }
-    case InAbs(env) :: rest =>
-      up(Focused(state.focus, rest, env))
+    case Some(Right(newState)) =>
+      display("\n======== UP ========\n")
+      display(Display(newState))
+      Right(newState)
   }
+
+  /** Moves the focus upwards one step.
+    *
+    * A result of `None` indicates that the value is within an empty context.
+    * Otherwise, results with the focus either on a value which must still be propagated upwards,
+    * or on an expression which can should later be downwards visited.
+    */
+  def stepUp(state: Focused[Value]): Option[Either[Focused[Value], Focused[Expr]]] =
+    state.context match {
+      case Nil =>
+        None
+      case InAppLeft(arg) :: rest =>
+        Some(Right(Focused(arg, InAppRight(state.focus) :: rest, state.env)))
+      case InAppRight(Closure(env, Abs(name, body))) :: rest =>
+        Some(Right(Focused(body, InAbs(state.env) :: rest, env + (name -> state.focus))))
+      case InAppRight(Prim(fun)) :: rest => {
+        val casted = fun.asInstanceOf[Value => Value]
+        Some(Left(Focused(casted(state.focus), rest, state.env)))
+      }
+      case InAbs(env) :: rest =>
+        Some(Left(Focused(state.focus, rest, env)))
+    }
 
   /** Evaluates an expression in a given environment
     * using a zipper-based method.
     */
-  def apply(expr: Expr, env: Env = Map.empty): Value =
-    eval(Focused(expr, Nil, env))
+  def apply(expr: Expr, env: Env = Map.empty): Value = {
+    val state = Focused(expr, Nil, env)
+    display("\n======= START ======\n")
+    display(Display(state))
+    val result = eval(state)
+    display("\n====== RESULT ======\n")
+    display(Display(result))
+    result
+  }
 }
+
+/** A zipper-based interpreter for lambda calulus expressions.
+  *
+  * The interpreter is not verbose.
+  */
+object ZippyInterpreter extends ZippyInterpreter(false)
+
+/** A verbose zipper-based interpreter for lambda calulus expressions. */
+object VerboseZippyInterpreter extends ZippyInterpreter(true)
 
 /** Simple recursive interpreter for lambda calculus expressions. */
 object RecInterpreter {
@@ -136,8 +198,7 @@ object RecInterpreter {
     * using the typical recursive interpretion method.
     */
   def apply(expr: Expr, env: Env = Map.empty): Value = expr match {
-    case Var(x) => env(x)
-    case abs@Abs(_, _) => Closure(env, abs)
+    case basic: Basic => basic.eval(env)
     case App(fun, arg) => {
       val v1 = apply(fun, env)
       val v2 = apply(arg, env)
@@ -146,12 +207,10 @@ object RecInterpreter {
           apply(body, newEnv + (name -> v2))
         }
         case Prim(fun) => {
-          val Prim(arg) = v2
-          val casted = fun.asInstanceOf[Any => Any]
-          Prim(casted(arg))
+          val casted = fun.asInstanceOf[Value => Value]
+          casted(v2)
         }
       }
     }
-    case prim@Prim(_) => prim
   }
 }
